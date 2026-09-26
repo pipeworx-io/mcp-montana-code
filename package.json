@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-montana-code",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Montana Code Annotated — state statutes by citation.",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-7e7378c76a54c2d949bc9864ed503c608cb05159f3b5fe95c1283e9eaeb7e36f",
-    "sourceCommit": "adb69d997f82a62e8e22b594488c7d04a227db35"
+    "sourceHash": "v1-a6a9ca78710628b573fa385afaab18969125297df658755c291af8ffa50b2e63",
+    "sourceCommit": "6182c4cfebddb94950e060b5d2fca18f18ad1aca"
   }
 }
