@@ -1,15 +1,46 @@
-# Montana statutes by citation
+# Montana Code Annotated
 
+Montana state statutes by citation, plus topic search across the whole code.
 Keyless.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1683+ live data sources.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1877+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
-See `docs/state-law-probe.md` — every state pack proves a MISS is
-distinguishable from a HIT before shipping.
+## Tools
+
+- `mt_code_section` -- the full text of one section by citation, e.g.
+  `1-1-307` (postponement of a day appointed for an action when it falls on a
+  holiday or Saturday) or `45-5-102` (deliberate homicide).
+- `mt_code_search` -- full-text search by topic or keyword, e.g.
+  "computing time period days holiday". Returns ranked sections with their
+  citation, heading and an opening excerpt; call `mt_code_section` with a
+  result for the full text. A query with no hits returns `found: false`, never
+  an empty list.
+
+## Coverage
+
+All 54 titles of the Montana Code Annotated (2025 edition), about 44,000
+sections. That includes Title 25, chapter 20, the Montana Rules of Civil
+Procedure (Rule 6, computing and extending time, is MCA 25-20-206), and the
+other court rule sets published in Title 25.
+
+Search is a full-text match, not semantic search: it ranks sections containing
+all the query's words, and falls back to any-word matching when no section
+contains them all.
+
+## How search works
+
+`mt_code_search` uses the shared statute search store: an FTS5 index in the
+`SEARCH_SHARD` Durable Object (shard name `mt-statutes`) and the section text
+in the shared datasets R2 bucket (`statutes/mt/<title>.json`, one bundle per
+title, plus `_index.json`). No new Cloudflare binding. The index is loaded by
+`scripts/ingest-montana-statutes.mjs`; re-run it after the Legislature
+publishes a new edition. Every response carries `data_as_of`.
 
 ## Data source
 
-Official state legislature site. Montana statutes are public record.
+Montana Legislature, Montana Code Annotated. Montana statutes are public
+record. Citation lookups call the Legislature live on each request; topic
+search reads a pre-fetched copy of the current code.
 
 ## Quick Start
 
@@ -55,7 +86,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1683+ data sources. The
+Both URLs reach the same gateway and the same 1877+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 

@@ -25,6 +25,140 @@ interface McpToolExport {
 }
 
 /**
+ * Shared full-text-search helpers for every caller of the FTS5 case/statute
+ * search shard (workers/gateway/src/search-shard.ts, `op match ?`).
+ *
+ * THE BUG THIS FIXES (fleet #3070). Several packs sent the caller's raw text
+ * straight into FTS5's MATCH operator. A comma, a '?', or an AND/OR/NOT/NEAR
+ * in the question is FTS5 syntax, so the shard throws a SQLite error — and
+ * the pack reported that as `index_unreachable`, an infrastructure failure,
+ * when the real problem was punctuation in a plain-language question. Even
+ * once the syntax is sanitized, ANDing every word of a whole sentence
+ * ("what does X require") returns zero hits, because no statute section
+ * contains the literal word "what" — a silent, wrong "no match" for what is
+ * actually a query-shape problem, not an absence of an answer.
+ *
+ * Two packs independently built the identical fix — illinois-code
+ * (bdc38b2c2) and france-legi's core.ts — before this existed. Lifted here so
+ * every other caller of the shard (north-carolina-code, indiana-code,
+ * wyoming-code, the court-listener case-law fan-out in caselaw-search.ts, and
+ * any future statute pack) gets it for free instead of re-deriving it a
+ * third, fourth, fifth time.
+ */
+
+type FtsMode = 'all' | 'any';
+
+/**
+ * Caller text -> a safe FTS5 MATCH expression. Every word (or quoted phrase)
+ * is re-quoted as an FTS5 string literal, so FTS5 operators (AND/OR/NOT/
+ * NEAR), column filters, and stray punctuation in a plain-language question
+ * — commas, question marks, the very things a real caller's sentence is full
+ * of — cannot change the query's meaning or throw a syntax error. Non-letter,
+ * non-digit characters are simply dropped by the `\p{L}\p{N}` match, which is
+ * what turns "bond, and license" (a syntax error against `op match ?`) into
+ * a clean three-term query.
+ *
+ * `mode: 'all'` ANDs every term (precise, for a short deliberate query);
+ * `mode: 'any'` ORs them (a relaxed retry for a whole sentence — see
+ * `shardSearch` below, which is the fallback policy this exists to support).
+ *
+ * `extraTerm`, when given, is ANDed on as its own already-resolved literal
+ * (e.g. a jurisdiction/code token every hit must also carry). Resolving a
+ * caller-facing id into that literal — france-legi's `codeToken` — is the
+ * caller's job, not this function's; this only assembles the final MATCH
+ * string.
+ *
+ * Returns null when the text has no searchable words at all (e.g. "???").
+ */
+function ftsQuery(text: string, mode: FtsMode, extraTerm?: string | null): string | null {
+  const parts: string[] = [];
+  const re = /"([^"]+)"|([\p{L}\p{N}]+)/gu;
+  for (const m of text.matchAll(re)) {
+    const raw = m[1] ?? m[2];
+    const words = raw.match(/[\p{L}\p{N}]+/gu);
+    if (!words?.length) continue;
+    parts.push(`"${words.join(' ')}"`);
+  }
+  if (!parts.length) return null;
+  const body = parts.length === 1 ? parts[0] : mode === 'all' ? parts.join(' AND ') : `(${parts.join(' OR ')})`;
+  return extraTerm ? `${body} AND "${extraTerm}"` : body;
+}
+
+interface FtsHit {
+  opinion_id: number;
+  score: number;
+}
+
+interface FtsShardResult {
+  hits: FtsHit[];
+  /** Which query actually produced `hits`. Null only when the text had no
+   *  searchable words at all (`ftsQuery` returned null) and the shard was
+   *  never called. */
+  mode: FtsMode | null;
+  /** False only on a genuine shard/transport failure — non-2xx, a network
+   *  error, or a body that doesn't parse. That is a real infrastructure
+   *  problem and callers MUST report it as one (e.g. `index_unreachable`).
+   *  A legitimate zero-hit search still reports `ok: true` with `hits: []`
+   *  — callers MUST NOT collapse that distinction (silent-zero-policy). */
+  ok: boolean;
+}
+
+interface ShardStub {
+  fetch(url: string, init: RequestInit): Promise<Response>;
+}
+
+/**
+ * Query ONE shard stub with the ALL->ANY fallback: try an ALL-words match
+ * first (the precise read of a short, deliberate query — "currency exchange
+ * license fee"), and only retry with an OR-ranked ANY-word match when the
+ * query has more than one word and the ALL attempt came back empty. A long
+ * plain-language question ANDs every one of its words, including stopwords
+ * like "what" or "does" that statute/opinion text is unlikely to contain
+ * verbatim — that AND-of-a-sentence zero is not evidence the answer is
+ * absent, it's the ALL mode being too strict for a sentence shaped input.
+ * bm25's own idf weighting discounts a word that appears in nearly every
+ * document, so the ANY retry needs no separate stopword list (same reasoning
+ * search-shard.ts's own "NO STOPWORD LIST" note gives for not stripping
+ * function words from the index itself).
+ */
+async function shardSearch(
+  stub: ShardStub,
+  text: string,
+  limit: number,
+  extraTerm?: string | null,
+): Promise<FtsShardResult> {
+  const runQuery = async (matchQuery: string): Promise<FtsHit[]> => {
+    const res = await stub.fetch('https://shard/query', {
+      method: 'POST',
+      body: JSON.stringify({ q: matchQuery, limit }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) throw new Error(`shard_http_${res.status}`);
+    const out = (await res.json()) as { results?: FtsHit[] };
+    return out.results ?? [];
+  };
+
+  const allQuery = ftsQuery(text, 'all', extraTerm);
+  if (!allQuery) return { hits: [], mode: null, ok: true };
+
+  try {
+    let hits = await runQuery(allQuery);
+    let mode: FtsMode = 'all';
+    if (!hits.length && /\s/.test(text)) {
+      const anyQuery = ftsQuery(text, 'any', extraTerm);
+      if (anyQuery) {
+        hits = await runQuery(anyQuery);
+        mode = 'any';
+      }
+    }
+    return { hits, mode, ok: true };
+  } catch {
+    return { hits: [], mode: null, ok: false };
+  }
+}
+
+
+/**
  * Was this failure OUR OWN web service? — the other half of `internal-db-class.ts`.
  *
  * fleet #1089 pulled failures from our own Postgres out of `upstream_down` by
@@ -295,10 +429,26 @@ async function httpErrorMessage(res: Response, name: string): Promise<string> {
   // internal-host-class.ts; no-op for every third-party upstream, which is why
   // this touches 481 packs' error text and changes none of it.
   return markInternalOrigin(
-    `${name}: ${res.status}${detailSuffix(await readDetail(res))}`,
+    `${name}: ${res.status}${detailSuffix(await readDetail(res))}${responseHints(res)}`,
     res.url,
     res.status,
   );
+}
+
+/**
+ * Facts about a FAILED response that live in its headers, not its body, appended
+ * so the gateway's classifier (which only ever sees this string) can tell a limit
+ * from a wall from a refusal (fleet #3477). Both are standard, both are absent on
+ * almost every response, and neither is invented: `Retry-After` is the server
+ * saying "come back later" (the one thing that makes a 403 a throttle), and
+ * Cloudflare marks a bot challenge with `cf-mitigated: challenge`.
+ */
+function responseHints(res: Response): string {
+  const hints: string[] = [];
+  const retryAfter = res.headers.get('retry-after');
+  if (retryAfter) hints.push(`retry-after: ${retryAfter.slice(0, 40)}`);
+  if ((res.headers.get('cf-mitigated') ?? '').toLowerCase() === 'challenge') hints.push('Cloudflare bot challenge (cf-mitigated: challenge)');
+  return hints.length ? ` (${hints.join('; ')})` : '';
 }
 
 /**
@@ -671,6 +821,254 @@ function collapse(s: string): string {
   return s.replace(/\s+/g, ' ').trim();
 }
 
+// ── Bounded readers — peak memory, not just wall time (fleet #3322) ──────
+//
+// `parseJson` above does `await res.text()` then `JSON.parse(raw)`, so a
+// multi-megabyte upstream body is held TWICE at peak: once as the raw string
+// and once as the object graph (which for an array of small objects runs
+// several times the byte size). Nothing in `workers/gateway` can see that
+// peak — it happens inside the pack, before any gateway code holds a payload —
+// which is why the gateway-side payload caps of #3293 and #3320 did not move
+// the 503/1102 rate at all.
+//
+// Measured on the live gateway, 2026-10-19, sha fa5de5c34, direct tools/call:
+//   statcan_list_cubes  8,049,566 B   <- one upstream array, no limit argument
+//   gnomad_gene BRCA1   2,732,706 B
+// Five of those in flight at the quality runner's width is ~40 MB of parse
+// peak against a 128 MB isolate; Cloudflare kills the isolate and every
+// request in flight returns 503/1102, which is why the victims look random.
+//
+// `readJsonArrayPrefix` is the fix for the dominant shape: an upstream that
+// returns one enormous top-level JSON array with no server-side paging. It
+// parses elements off the stream and DISCARDS the consumed bytes, so peak
+// retained memory is one element plus one chunk rather than the whole body,
+// and it cancels the body as soon as it has what it was asked for.
+
+/** Default ceiling for a single upstream JSON body read into an isolate.
+ *  Chosen so the known tail (statcan 8.0 MB, gnomad 2.7 MB) is bounded well
+ *  below the point where a handful of concurrent reads exhausts 128 MB. */
+const DEFAULT_MAX_JSON_BYTES = 1_500_000;
+
+interface JsonArrayPrefix<T> {
+  /** The decoded elements, at most `maxItems` of them. */
+  items: T[];
+  /** True when the upstream array had more elements than we read. */
+  truncated: boolean;
+  /** Bytes actually pulled off the socket — the number that bounds memory. */
+  bytesRead: number;
+  /** `Content-Length` if the upstream declared one, else null. */
+  declaredBytes: number | null;
+}
+
+/**
+ * Read the FIRST `maxItems` elements of a top-level JSON array off a response
+ * stream without ever materialising the whole body.
+ *
+ * Use this instead of `parseJson` when the upstream returns one big array and
+ * offers no `limit`/`offset` of its own. Peak retained memory is one element
+ * plus the current chunk; the body is cancelled as soon as `maxItems` is
+ * reached, so the remaining megabytes are never transferred at all.
+ *
+ *     const { items, truncated } = await readJsonArrayPrefix<Cube>(
+ *       res, 'StatCan WDS', { maxItems: limit + offset });
+ *
+ * `maxBytes` is a second, independent backstop for a pathological element (a
+ * single 50 MB object): hitting it stops the read and sets `truncated`, rather
+ * than throwing, because a partial answer plus an explicit truncated flag is
+ * more useful to a caller than an error.
+ */
+async function readJsonArrayPrefix<T>(
+  res: Response,
+  name: string,
+  opts: { maxItems: number; maxBytes?: number },
+): Promise<JsonArrayPrefix<T>> {
+  const maxBytes = opts.maxBytes ?? DEFAULT_MAX_JSON_BYTES;
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declaredBytes = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  // No streaming body available (a mock, or an already-buffered response):
+  // fall back to the whole-text path so behaviour stays correct, just unbounded.
+  if (!res.body) {
+    const all = await parseJson<T[]>(res, name);
+    if (!Array.isArray(all)) throw new Error(`upstream_down: ${name} returned ${typeof all} where a JSON array was expected.`);
+    return {
+      items: all.slice(0, opts.maxItems),
+      truncated: all.length > opts.maxItems,
+      bytesRead: declaredBytes ?? 0,
+      declaredBytes,
+    };
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const items: T[] = [];
+
+  let buf = '';
+  let scan = 0;
+  let bytesRead = 0;
+  let started = false; // consumed the opening '['
+  let arrayEnded = false;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  let elemStart = -1;
+  let truncated = false;
+
+  const push = (text: string) => {
+    const t = text.trim();
+    if (!t) return;
+    items.push(JSON.parse(t) as T);
+  };
+
+  try {
+    outer: while (items.length < opts.maxItems && !arrayEnded) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buf += decoder.decode(value, { stream: true });
+      if (bytesRead > maxBytes) { truncated = true; break; }
+
+      for (; scan < buf.length; scan++) {
+        const ch = buf[scan];
+
+        if (inStr) {
+          if (esc) { esc = false; continue; }
+          if (ch === '\\') { esc = true; continue; }
+          if (ch === '"') inStr = false;
+          continue;
+        }
+
+        if (!started) {
+          if (ch === '[') { started = true; continue; }
+          if (ch.trim() === '') continue;
+          throw new Error(
+            `upstream_down: ${name} returned a body that does not begin with a JSON array (saw ${JSON.stringify(ch)}). ` +
+              'This reader is only for upstreams that answer with one top-level array.',
+          );
+        }
+
+        if (ch === '"') { if (depth === 0 && elemStart < 0) elemStart = scan; inStr = true; continue; }
+
+        if (ch === '{' || ch === '[') {
+          if (depth === 0 && elemStart < 0) elemStart = scan;
+          depth++;
+          continue;
+        }
+
+        if (ch === '}' || ch === ']') {
+          if (depth > 0) {
+            depth--;
+            if (depth === 0 && elemStart >= 0) {
+              push(buf.slice(elemStart, scan + 1));
+              elemStart = -1;
+              if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+            }
+            continue;
+          }
+          // depth 0 and a closing bracket: the end of the top-level array.
+          if (elemStart >= 0) { push(buf.slice(elemStart, scan)); elemStart = -1; }
+          arrayEnded = true;
+          break outer;
+        }
+
+        if (ch === ',' && depth === 0) {
+          if (elemStart >= 0) {
+            push(buf.slice(elemStart, scan));
+            elemStart = -1;
+            if (items.length >= opts.maxItems) { truncated = true; scan++; break outer; }
+          }
+          continue;
+        }
+
+        // A bare scalar element (number / true / false / null).
+        if (depth === 0 && elemStart < 0 && ch.trim() !== '') elemStart = scan;
+      }
+
+      // Drop everything already consumed. THIS is what bounds memory: without
+      // it `buf` grows to the full body and the reader is streaming in name only.
+      if (elemStart >= 0) {
+        buf = buf.slice(elemStart);
+        scan -= elemStart;
+        elemStart = 0;
+      } else {
+        buf = buf.slice(scan);
+        scan = 0;
+      }
+    }
+  } finally {
+    // Cancel rather than drain: the point is that the remaining megabytes are
+    // never transferred. A cancel on an already-finished body is a no-op.
+    await reader.cancel().catch(() => {});
+  }
+
+  return { items, truncated, bytesRead, declaredBytes };
+}
+
+/**
+ * `parseJson`, with a hard ceiling on how many bytes are read.
+ *
+ * For an upstream whose body is not a single array (so `readJsonArrayPrefix`
+ * does not apply) but which can still answer with megabytes. Unlike the array
+ * reader this one THROWS when the cap is hit, because a truncated prefix of an
+ * arbitrary JSON document is not parseable and there is no partial answer to
+ * hand back. A declared `Content-Length` over the cap is refused before a
+ * single chunk is read.
+ */
+async function parseJsonBounded<T>(
+  res: Response,
+  name: string,
+  maxBytes: number = DEFAULT_MAX_JSON_BYTES,
+): Promise<T> {
+  const declaredRaw = Number(res.headers.get('content-length'));
+  const declared = Number.isFinite(declaredRaw) && declaredRaw > 0 ? declaredRaw : null;
+
+  const tooBig = (n: number) =>
+    new Error(
+      `upstream_down: ${name} answered with ${n.toLocaleString()} bytes, over this pack's ${maxBytes.toLocaleString()}-byte ceiling. ` +
+        'The body is not read past the ceiling on purpose — a few concurrent reads of a body that size exhaust the ' +
+        'Worker isolate and take every other in-flight request down with them. Narrow the request (a smaller range, ' +
+        'a specific id, or a lower limit) and retry.',
+    );
+
+  if (declared !== null && declared > maxBytes) {
+    await res.body?.cancel().catch(() => {});
+    throw tooBig(declared);
+  }
+  if (!res.body) return parseJson<T>(res, name);
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let raw = '';
+  let bytesRead = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      if (bytesRead > maxBytes) throw tooBig(bytesRead);
+      raw += decoder.decode(value, { stream: true });
+    }
+    raw += decoder.decode();
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+
+  if (!raw.trim()) {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with an EMPTY body where JSON was expected. ` +
+        'Nothing about the request can cause this — it is an upstream fault, and the same call may well work on retry.',
+    );
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    throw new Error(
+      `upstream_down: ${name} answered HTTP ${res.status} with a body that is not valid JSON. ` +
+        `It begins: ${stripMarkup(raw).slice(0, 120) || '(unreadable)'}`,
+    );
+  }
+}
+
 
 /**
  * HTML-to-text helpers shared by the state statute packs.
@@ -836,6 +1234,26 @@ const UA = 'pipeworx-mcp-montana-code/1.0 (+https://pipeworx.io)';
 
 const pad = (s: string) => `${s.padStart(3, '0')}0`;
 
+// Topic search reads the pre-fetched code from the shared datasets bucket and
+// the full-text index from the shared search shard (loaded by
+// scripts/ingest-montana-statutes.mjs, fleet #3668).
+const R2_PREFIX = 'statutes/mt';
+interface R2Like { get(key: string): Promise<{ text(): Promise<string> } | null> }
+interface IndexEntry { id: number; title: string; section: string; heading: string | null; text_chars: number }
+interface StatuteIndex { jurisdiction: string; mca_year: string; ingested_at: string; entries: IndexEntry[] }
+interface BundleSection { section: string; heading: string | null; text: string; history: string | null }
+interface Bundle { title: string; title_name: string | null; sections: BundleSection[] }
+
+async function readJson<T>(r2: R2Like, key: string): Promise<T | null> {
+  try {
+    const obj = await r2.get(key);
+    if (!obj) return null;
+    return JSON.parse(await obj.text()) as T;
+  } catch {
+    return null;
+  }
+}
+
 const tools: McpToolExport['tools'] = [{
   name: 'mt_code_section',
   description:
@@ -847,9 +1265,96 @@ const tools: McpToolExport['tools'] = [{
     },
     required: ['section'],
   },
+}, {
+  name: 'mt_code_search',
+  description:
+    'Search the Montana Code Annotated BY TOPIC or keyword rather than citation -- "computing time deadline holiday", "landlord security deposit", "deliberate homicide". Covers all 54 MCA titles, including Title 25 chapter 20, the Montana Rules of Civil Procedure (Rule 6 computing time is MCA 25-20-206). Returns ranked sections with citation, heading and an opening excerpt; call mt_code_section with a result\'s citation for the full text. Full-text match, not semantic search. A query with no hits returns found:false. Keyless.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      query: { type: 'string', description: 'Topic or keywords, e.g. "computing time period days holiday".' },
+      limit: { type: 'number', description: 'Max results, default 10, max 25.' },
+    },
+    required: ['query'],
+  },
 }];
 
+async function mtCodeSearch(args: Record<string, unknown>) {
+  const q = String(args.query ?? '').trim();
+  if (!q) {
+    return { found: false, reason: 'empty_query',
+      message: 'mt_code_search needs a query -- search by topic, e.g. "computing time period holiday".',
+      hint: 'To look up a known citation use mt_code_section instead.' };
+  }
+  const limit = Math.min(25, Math.max(1, Number(args.limit) || 10));
+  const ns = args._searchShards as DurableObjectNamespace | undefined;
+  const r2 = args._r2 as R2Like | undefined;
+  if (!ns || !r2) {
+    return { found: false, reason: 'search_unavailable',
+      message: 'Topic search runs through Pipeworx\'s full-text index and is not available in a standalone install of this pack.',
+      hint: 'mt_code_section (citation lookup) still works standalone.' };
+  }
+  // Over-fetch: a hit whose id is missing from the index is dropped below.
+  const fetchLimit = Math.min(100, Math.max(limit * 3, 30));
+  const stub = ns.get(ns.idFromName('mt-statutes'));
+  const sr = await shardSearch(stub, q, fetchLimit);
+  if (!sr.ok) {
+    return { found: false, reason: 'index_unreachable',
+      message: 'The Montana Code search index did not answer. This is an infrastructure failure, not an absence of matching sections.' };
+  }
+  if (!sr.hits.length) {
+    return { found: false, query: q,
+      message: `No section matched "${q}" in the Montana Code Annotated index.`,
+      hint: 'Try fewer or more general words -- this is a full-text match, not semantic search.' };
+  }
+  const index = await readJson<StatuteIndex>(r2, `${R2_PREFIX}/_index.json`);
+  if (!index) {
+    return { found: false, reason: 'index_unreachable',
+      message: 'The Montana Code citation index did not load. This is an infrastructure failure, not an absence of matching sections.' };
+  }
+  const byId = new Map(index.entries.map((e) => [e.id, e]));
+  const rows = sr.hits
+    .map((h) => ({ e: byId.get(h.opinion_id), score: h.score }))
+    .filter((r): r is { e: IndexEntry; score: number } => !!r.e)
+    .slice(0, limit);
+
+  // Opening excerpt for the top few, from the per-title bundle (cheap: one
+  // read per distinct title among those hits).
+  const EXCERPT_FOR = 5;
+  const excerpts = new Map<string, string>();
+  const titles = [...new Set(rows.slice(0, EXCERPT_FOR).map((r) => r.e.title))];
+  for (const t of titles) {
+    const b = await readJson<Bundle>(r2, `${R2_PREFIX}/${t}.json`);
+    if (!b) continue;
+    for (const r of rows.slice(0, EXCERPT_FOR)) {
+      if (r.e.title !== t) continue;
+      const sec = b.sections.find((x) => x.section === r.e.section);
+      if (sec) excerpts.set(r.e.section, sec.text.length > 600 ? `${sec.text.slice(0, 600).trimEnd()}...` : sec.text);
+    }
+  }
+  const results = rows.map((r) => ({
+    citation: `MCA \u00A7 ${r.e.section}`,
+    title: r.e.title,
+    section: r.e.section,
+    heading: r.e.heading,
+    excerpt: excerpts.get(r.e.section) ?? null,
+    score: r.score,
+  }));
+  return {
+    found: results.length > 0,
+    query: q,
+    match: sr.mode === 'any' ? 'any_word' : 'all_words',
+    count: results.length,
+    results,
+    mca_year: index.mca_year,
+    data_as_of: index.ingested_at,
+    source: 'Montana Code Annotated full-text search (Montana Legislature)',
+    hint: 'Call mt_code_section with the section from a result to get its full text.',
+  };
+}
+
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  if (name === 'mt_code_search') return mtCodeSearch(args);
   if (name !== 'mt_code_section') throw new Error(`Unknown tool: ${name}`);
   const raw = String(args.section ?? '').trim().replace(/\s+/g, '').replace(/^MCA/i, '');
   const m = /^(\d+)-(\d+)-(\d)(\d{2})$/.exec(raw);
@@ -868,7 +1373,11 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       hint: 'Section numbers are not contiguous — repealed sections are normal.' };
   }
   if (!res.ok) throw new Error(`Montana Legislature returned HTTP ${res.status} for ${raw}`);
-  const full = statuteText(await readStatuteResponse(res));
+  const html = await readStatuteResponse(res);
+  // The page wraps the statute in <div class="section-content">; use it when
+  // present (rules pages carry no "NN-NN-NNN." anchor to find the text by).
+  const body = /<div class="section-content">([\s\S]*?)<\/div>/.exec(html);
+  const full = body ? statuteText(body[1]) : statuteText(html);
   // The page title repeats the citation before the site nav ("45-5-102.
   // Deliberate homicide, MCA / Toggle navigation / Contents ..."), so anchor
   // on the LAST occurrence of the heading — the first is the <title>, the
@@ -878,7 +1387,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
   let at = -1;
   for (let mm = re.exec(full); mm; mm = re.exec(full)) at = mm.index;
   const text = at === -1 ? full : full.slice(at).trim();
-  const heading = (text.match(/\d+-\d+-\d+\.\s*([^.]{2,120})\./) ?? [])[1] ?? null;
+  const heading = (text.match(/\d+-\d+-\d+\.\s*([^.]{2,120})\./) ?? [])[1]
+    ?? (text.split('\n')[0] ?? '').slice(0, 160).replace(/\.$/, '') ?? null;
   return {
     citation: `MCA § ${raw}`, section: raw, title, chapter, part,
     heading: heading ? heading.trim() : null,
