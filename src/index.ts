@@ -1204,6 +1204,85 @@ function sliceSection(text: string, heading: RegExp, next: RegExp): string | nul
   }
   return best && best.length > 0 ? best : null;
 }
+
+
+/**
+ * Read side of the shared stored statute copy (fleet #3754).
+ *
+ * The write side was already shared (scripts/lib/statute-bake.mjs writes the chapter files,
+ * scripts/lib/upload-statute-bundles.mjs publishes them to R2 under `statutes/<xx>/`). Each pack then carried
+ * its own copy of the reader below: Michigan, Ohio and West Virginia are byte-for-byte the same except for
+ * the prefix. This is that reader, once. Packs hand it the injected `_r2` binding (manifest `injectR2`) and
+ * nothing is evaluated at module scope except an empty Map.
+ *
+ * ABSENCE IS NEVER MEMOISED: a missing object or a failed read is retried on the next call, so a chapter
+ * published later is not latched as missing. A read that fails returns null, which a pack must treat as
+ * "ask the source", never as "no such section".
+ */
+
+interface R2Like$shared {
+  get(key: string): Promise<{ text(): Promise<string> } | null>;
+}
+
+interface StoredSection { h: string | null; t: string; e?: string | null }
+interface StoredChapterHead {
+  chapter: string;
+  dataAsOf: string;
+  toc: string[];
+  noText?: string[];
+  sections?: Record<string, StoredSection>;
+  parts?: number;
+  partOf?: Record<string, number>;
+}
+interface StoredPart { sections: Record<string, StoredSection> }
+
+const MEMO_TTL_MS = 10 * 60 * 1000;
+const memo = new Map<string, { at: number; doc: unknown }>();
+
+/**
+ * One JSON object from the store, parsed and validated, memoised per isolate for a few minutes.
+ * `memoMax` bounds how many parsed objects an isolate keeps (a multi-MB title bundle wants 2, a ~100 KB chapter 6).
+ */
+async function readStoredJson<T>(
+  r2: unknown, key: string, valid: (d: any) => boolean, memoMax = 6,
+): Promise<T | null> {
+  if (!r2 || typeof (r2 as R2Like$shared).get !== 'function') return null;
+  const hit = memo.get(key);
+  if (hit && Date.now() - hit.at < MEMO_TTL_MS) return hit.doc as T;
+  try {
+    const obj = await (r2 as R2Like$shared).get(key);
+    if (!obj) return null;
+    const d = JSON.parse(await obj.text());
+    if (!valid(d)) return null;
+    memo.delete(key);
+    memo.set(key, { at: Date.now(), doc: d });
+    while (memo.size > memoMax) memo.delete(memo.keys().next().value as string);
+    return d as T;
+  } catch {
+    return null;
+  }
+}
+
+type StoredLookup = { head: StoredChapterHead; hit: StoredSection | null };
+
+/**
+ * The stored chapter head (`<prefix>/ch-<chapter>.json`), plus the section's text when the copy has it, following
+ * the head-plus-parts layout statute-bake.mjs writes. Null = go to the live path. `hit: null` with a head means the
+ * chapter is stored and the section has no stored text: check `head.toc` to tell "does not exist" from "listed, no text".
+ */
+async function storedChapterSection(
+  r2: unknown, prefix: string, chapter: string, section: string,
+): Promise<StoredLookup | null> {
+  const head = await readStoredJson<StoredChapterHead>(r2, `${prefix}/ch-${chapter}.json`,
+    (d) => d && Array.isArray(d.toc) && typeof d.dataAsOf === 'string' && (d.sections || (typeof d.parts === 'number' && d.partOf)));
+  if (!head) return null;
+  if (head.sections) return { head, hit: head.sections[section] ?? null };
+  const k = head.partOf?.[section];
+  if (k === undefined) return { head, hit: null };
+  const part = await readStoredJson<StoredPart>(r2, `${prefix}/ch-${chapter}.p${k}.json`, (d) => d && d.sections);
+  if (!part) return null; // the part is unreadable: do not claim "not found", ask the source
+  return { head, hit: part.sections[section] ?? null };
+}
 /**
  * Montana Code Annotated — state statutes by citation.
  *
@@ -1242,7 +1321,7 @@ interface R2Like { get(key: string): Promise<{ text(): Promise<string> } | null>
 interface IndexEntry { id: number; title: string; section: string; heading: string | null; text_chars: number }
 interface StatuteIndex { jurisdiction: string; mca_year: string; ingested_at: string; entries: IndexEntry[] }
 interface BundleSection { section: string; heading: string | null; text: string; history: string | null }
-interface Bundle { title: string; title_name: string | null; sections: BundleSection[] }
+interface Bundle { title: string; title_name: string | null; sections: BundleSection[]; ingested_at?: string }
 
 async function readJson<T>(r2: R2Like, key: string): Promise<T | null> {
   try {
@@ -1364,6 +1443,26 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
       hint: 'MCA sections are title-chapter-section with a three-digit section, e.g. "45-5-102" (deliberate homicide) or "61-8-401" (DUI).' };
   }
   const [, title, chapter, part, sec] = m;
+
+  // Stored copy first (fleet #3754): archive.legmt.gov refuses some data centres (70 upstream_down against 171
+  // successes from external callers over 14 days), and the whole Code is already in the shared store for
+  // topic search. A section the stored title has is answered with NO upstream fetch. A title that cannot be read,
+  // or a section it does not list, falls through to the live path below, so a stored-copy miss never becomes a
+  // false "not found".
+  const bundle = await readStoredJson<Bundle>(args._r2, `${R2_PREFIX}/${Number(title)}.json`,
+    (d) => d && Array.isArray(d.sections) && typeof d.ingested_at === 'string', 2);
+  const stored = bundle?.sections.find((x) => x.section === raw.replace(/^0+(?=\d)/, ''));
+  if (bundle && stored) {
+    return {
+      citation: `MCA \u00A7 ${raw}`, section: raw, title, chapter, part,
+      heading: stored.heading, text: stored.text, text_chars: stored.text.length,
+      history: stored.history ?? null,
+      source: 'Montana Legislature, Montana Code Annotated',
+      attribution: 'Montana statutes are public record.',
+      served_from: 'stored-copy', stale: false, data_as_of: bundle.ingested_at,
+    };
+  }
+
   const t = pad(title), c = pad(chapter), p = pad(part), s = pad(sec);
   const url = `${BASE}/title_${t}/chapter_${c}/part_${p}/section_${s}/${t}-${c}-${p}-${s}.html`;
   const res = await pwFetch(url, { headers: { 'User-Agent': UA } });

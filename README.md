@@ -3,7 +3,7 @@
 Montana state statutes by citation, plus topic search across the whole code.
 Keyless.
 
-Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1877+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
+Part of [Pipeworx](https://pipeworx.io) — an MCP gateway connecting AI agents to 1856+ live data sources. This is an independent, unofficial integration — not affiliated with, endorsed by, or published by the upstream provider.
 
 ## Tools
 
@@ -41,6 +41,16 @@ publishes a new edition. Every response carries `data_as_of`.
 Montana Legislature, Montana Code Annotated. Montana statutes are public
 record. Citation lookups call the Legislature live on each request; topic
 search reads a pre-fetched copy of the current code.
+
+## Stored copy and `data_as_of` (fleet #3754)
+
+`mt_code_section` answers from the Montana Code Annotated already held in the shared statute store (R2,
+`statutes/mt/`, one object per title, loaded by `scripts/ingest-montana-statutes.mjs` for topic search). The
+legislature's archive site refuses requests that leave from some data centres (70 "upstream down" against 171
+successes from external callers over 14 days). A section the stored title lists is answered with no upstream
+request: `served_from: "stored-copy"`, `data_as_of` (when the title was last read from the source) and the
+section's `history` line. A title that cannot be read, or a section it does not list, falls back to the live read.
+Refreshing the store refreshes both search and lookup.
 
 ## Quick Start
 
@@ -86,7 +96,7 @@ directly, instead of just this one's:
 }
 ```
 
-Both URLs reach the same gateway and the same 1877+ data sources. The
+Both URLs reach the same gateway and the same 1856+ data sources. The
 only difference is which pack's tools are listed **directly**; `ask_pipeworx`
 reaches all of them from either one.
 
