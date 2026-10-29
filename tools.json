@@ -1,0 +1,38 @@
+[
+  {
+    "name": "mt_code_section",
+    "description": "Get the FULL TEXT of a section of the Montana Code Annotated — Montana state law — by citation. \"MCA 45-5-102\" is deliberate homicide. Returns the statutory text. Keyless. Use for \"what does MCA 45-5-102 say\" or to check a Montana statute a case relies on.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "section": {
+          "type": "string",
+          "description": "Section as cited, e.g. \"45-5-102\" (deliberate homicide) or \"61-8-401\" (DUI). Title-chapter-section."
+        }
+      },
+      "required": [
+        "section"
+      ]
+    }
+  },
+  {
+    "name": "mt_code_search",
+    "description": "Search the Montana Code Annotated BY TOPIC or keyword rather than citation -- \"computing time deadline holiday\", \"landlord security deposit\", \"deliberate homicide\". Covers all 54 MCA titles, including Title 25 chapter 20, the Montana Rules of Civil Procedure (Rule 6 computing time is MCA 25-20-206). Returns ranked sections with citation, heading and an opening excerpt; call mt_code_section with a result's citation for the full text. Full-text match, not semantic search. A query with no hits returns found:false. Keyless.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Topic or keywords, e.g. \"computing time period days holiday\"."
+        },
+        "limit": {
+          "type": "number",
+          "description": "Max results, default 10, max 25."
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  }
+]
